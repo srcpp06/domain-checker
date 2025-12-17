@@ -5,6 +5,8 @@ import whois
 import asyncio
 import os
 from datetime import datetime, timezone
+from fastapi import WebSocket
+from starlette.websockets import WebSocketDisconnect
 
 import httpx
 from fastapi import FastAPI, WebSocket
@@ -210,9 +212,13 @@ async def websocket_endpoint(websocket: WebSocket):
             if domain:
                 await run_all(websocket, domain)
 
+    except WebSocketDisconnect:
+        # ✅ CLIENT O‘ZI UZDI — NORMAL HOLAT
+        print("🔌 Client disconnected")
+
     except Exception as e:
-        # ❗ websocket.close() YO‘Q — ASOSIY FIX SHU
-        print("❌ WS error:", e)
+        # ❌ close() YO‘Q
+        print("❌ WS unexpected error:", e)
 
 
 # ===== RUN =====
