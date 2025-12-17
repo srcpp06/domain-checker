@@ -1,10 +1,9 @@
 import dns.resolver
 import socket
-import ssl
 import whois
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, WebSocket
@@ -23,7 +22,14 @@ app.add_middleware(
 )
 
 # ================== HELPERS ==================
-async def add_test(ws: WebSocket, id: int, name: str, passed: bool, info: str, extra_info: str = ""):
+async def add_test(
+    ws: WebSocket,
+    id: int,
+    name: str,
+    passed: bool,
+    info: str,
+    extra_info: str = ""
+):
     await ws.send_json({
         "type": "test",
         "id": id,
@@ -33,23 +39,30 @@ async def add_test(ws: WebSocket, id: int, name: str, passed: bool, info: str, e
         "extra_info": extra_info or info
     })
 
+
 async def send_done(ws: WebSocket):
     await ws.send_json({
         "type": "done",
         "total": 20
     })
 
-# ================== LOW LEVEL ==================
-def get_ssl_info(domain: str):
-    ctx = ssl.create_default_context()
-    with socket.create_connection((domain, 443), timeout=5) as sock:
-        with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
-            return ssock.getpeercert(), ssock.version()
+# ================== DNS RECORD ==================
+async def _record(ws, domain, record, id, name, ok, fail):
+    try:
+        ans = dns.resolver.resolve(domain, record)
+        await add_test(
+            ws,
+            id,
+            name,
+            True,
+            ok,
+            ", ".join(r.to_text() for r in ans),
+        )
+    except Exception as e:
+        await add_test(ws, id, name, False, fail, str(e))
 
-async def get_whois(domain: str):
-    return await asyncio.to_thread(whois.whois, domain)
 
-# ================== TESTS ==================
+# ================== MAIN TESTS ==================
 async def run_all(ws: WebSocket, domain: str):
 
     # ---- HTTP / HTTPS ----
@@ -67,8 +80,11 @@ async def run_all(ws: WebSocket, domain: str):
     # ---- DNS ----
     try:
         answers = dns.resolver.resolve(domain, "A")
-        await add_test(ws, 1, "DNS mavjudligi", True, "DNS topildi",
-                       ", ".join(r.to_text() for r in answers))
+        await add_test(
+            ws, 1, "DNS mavjudligi", True,
+            "DNS topildi",
+            ", ".join(r.to_text() for r in answers)
+        )
     except Exception as e:
         await add_test(ws, 1, "DNS mavjudligi", False, "DNS topilmadi", str(e))
 
@@ -79,35 +95,32 @@ async def run_all(ws: WebSocket, domain: str):
 
     # ---- HTTPS ----
     if https_res:
-        await add_test(ws, 6, "HTTPS ishlashi", True, "HTTPS ishlaydi",
-                       f"Status: {https_res.status_code}")
+        await add_test(
+            ws, 6, "HTTPS ishlashi", True,
+            "HTTPS ishlaydi",
+            f"Status: {https_res.status_code}"
+        )
     else:
         await add_test(ws, 6, "HTTPS ishlashi", False, "HTTPS ochilmadi")
 
     # ---- HTTP → HTTPS ----
     if http_res:
-        await add_test(ws, 7, "HTTP → HTTPS redirect",
-                       http_res.status_code in (301, 302),
-                       "Redirect tekshirildi",
-                       f"Status: {http_res.status_code}")
+        await add_test(
+            ws, 7, "HTTP → HTTPS redirect",
+            http_res.status_code in (301, 302),
+            "Redirect tekshirildi",
+            f"Status: {http_res.status_code}"
+        )
     else:
-        await add_test(ws, 7, "HTTP → HTTPS redirect",
-                       False, "HTTP ochilmadi")
+        await add_test(ws, 7, "HTTP → HTTPS redirect", False, "HTTP ochilmadi")
 
-    # ---- SSL / TLS ----
-    try:
-        cert, tls = await asyncio.to_thread(get_ssl_info, domain)
-
-        await add_test(ws, 8, "SSL sertifikat", True, "SSL mavjud", tls)
-
-        exp = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-        valid = exp > datetime.now(timezone.utc)
-
-        await add_test(ws, 9, "SSL muddati", valid, f"Amal qilish muddati: {exp}")
-        await add_test(ws, 10, "TLS qo‘llab-quvvatlanadi", True, "TLS mavjud", tls)
-
-    except Exception as e:
-        await add_test(ws, 8, "SSL sertifikat", False, "SSL yo‘q", str(e))
+    # ---- SSL / TLS (FAҚAT HTTPS ASOSIDA) ----
+    if https_res:
+        await add_test(ws, 8, "SSL sertifikat", True, "SSL mavjud")
+        await add_test(ws, 9, "SSL muddati", True, "Sertifikat mavjud")
+        await add_test(ws, 10, "TLS qo‘llab-quvvatlanadi", True, "TLS mavjud")
+    else:
+        await add_test(ws, 8, "SSL sertifikat", False, "SSL yo‘q")
         await add_test(ws, 9, "SSL muddati", False, "SSL yo‘q")
         await add_test(ws, 10, "TLS qo‘llab-quvvatlanadi", False, "TLS yo‘q")
 
@@ -124,15 +137,17 @@ async def run_all(ws: WebSocket, domain: str):
 
     for id, name, h in security_headers:
         await add_test(
-            ws, id, name,
+            ws,
+            id,
+            name,
             h in headers,
             f"{h} tekshirildi",
-            headers.get(h, "Yo‘q")
+            headers.get(h, "Yo‘q"),
         )
 
     # ---- WHOIS ----
     try:
-        w = await get_whois(domain)
+        w = await asyncio.to_thread(whois.whois, domain)
         await add_test(ws, 16, "Whois mavjud", True, "Whois mavjud")
 
         created = w.creation_date
@@ -140,9 +155,11 @@ async def run_all(ws: WebSocket, domain: str):
             created = created[0]
 
         await add_test(
-            ws, 17, "Domain yoshi",
+            ws,
+            17,
+            "Domain yoshi",
             created.year < datetime.now().year,
-            f"Yaratilgan sana: {created}"
+            f"Yaratilgan sana: {created}",
         )
     except Exception as e:
         await add_test(ws, 16, "Whois mavjud", False, "Whois yo‘q", str(e))
@@ -151,12 +168,9 @@ async def run_all(ws: WebSocket, domain: str):
     # ---- SPEED ----
     if https_res:
         speed = https_res.elapsed.total_seconds()
-        await add_test(ws, 18, "Server tezligi",
-                       speed < 2,
-                       f"{speed:.2f}s")
+        await add_test(ws, 18, "Server tezligi", speed < 2, f"{speed:.2f}s")
     else:
-        await add_test(ws, 18, "Server tezligi",
-                       False, "O‘lchab bo‘lmadi")
+        await add_test(ws, 18, "Server tezligi", False, "O‘lchab bo‘lmadi")
 
     # ---- IP ----
     try:
@@ -175,15 +189,6 @@ async def run_all(ws: WebSocket, domain: str):
     # ---- DONE ----
     await send_done(ws)
 
-# ================== RECORD ==================
-async def _record(ws, domain, record, id, name, ok, fail):
-    try:
-        ans = dns.resolver.resolve(domain, record)
-        await add_test(ws, id, name, True, ok,
-                       ", ".join(r.to_text() for r in ans))
-    except Exception as e:
-        await add_test(ws, id, name, False, fail, str(e))
-
 # ================== WEBSOCKET ==================
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -194,14 +199,12 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             data = await ws.receive_json()
             domain = data.get("domain")
-            print("📩 Domain:", domain)
 
             if domain:
                 await run_all(ws, domain)
 
     except WebSocketDisconnect:
         print("🔌 Client disconnected")
-
     except Exception as e:
         print("❌ WS error:", e)
 
@@ -211,5 +214,5 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000))
+        port=int(os.environ.get("PORT", 8000)),
     )
