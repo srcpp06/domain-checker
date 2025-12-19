@@ -4,6 +4,8 @@ import socket
 import whois
 import asyncio
 import os
+from sqlalchemy import create_engine
+
 import hashlib
 from datetime import datetime
 
@@ -16,11 +18,11 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = int(os.getenv("DB_PORT", "3306"))
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.environ["DB_PORT"])
+DB_USER = os.environ["DB_USER"]
+DB_PASSWORD = os.environ["DB_PASSWORD"]
+DB_NAME = os.environ["DB_NAME"]
 
 DATABASE_URL = (
     f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}"
@@ -28,6 +30,7 @@ DATABASE_URL = (
 )
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
