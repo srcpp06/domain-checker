@@ -1,8 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 sqlalchemy
-aiomysql
-python-dotenv
-dnspython
+pymysql
 httpx
 python-whois
+dnspython
+pydantic
