@@ -1,18 +1,62 @@
+import json
 import dns.resolver
 import socket
 import whois
 import asyncio
 import os
+import hashlib
 from datetime import datetime
 
 import httpx
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.websockets import WebSocketDisconnect
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Boolean,
+    Text, DateTime, ForeignKey
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
+
+# ================== DATABASE ==================
+DATABASE_URL = "mysql+pymysql://USER:VpwfzwEsoyVyWmWzBOuLNodFpfmChcqJ@HOST:PORT/railway"
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+# ================== MODELS ==================
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    username = Column(String(50), unique=True)
+    password_hash = Column(String(255))
+
+
+class DomainCheck(Base):
+    __tablename__ = "domain_checks"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    domain = Column(String(255))
+    percent = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    results = relationship("DomainCheckResult", cascade="all, delete")
+
+
+class DomainCheckResult(Base):
+    __tablename__ = "domain_check_results"
+    id = Column(Integer, primary_key=True)
+    check_id = Column(Integer, ForeignKey("domain_checks.id", ondelete="CASCADE"))
+    test_code = Column(Integer)
+    test_name = Column(String(100))
+    passed = Column(Boolean)
+    info = Column(Text)
+    extra_info = Column(Text)
+
+
+Base.metadata.create_all(engine)
 
 # ================== APP ==================
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,51 +66,42 @@ app.add_middleware(
 )
 
 # ================== HELPERS ==================
-async def add_test(
-    ws: WebSocket,
-    id: int,
-    name: str,
-    passed: bool,
-    info: str,
-    extra_info: str = ""
-):
-    await ws.send_json({
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+async def add_test(ws, results, code, name, passed, info, extra=""):
+    data = {
         "type": "test",
-        "id": id,
+        "id": code,
         "name": name,
         "passed": passed,
         "info": info,
-        "extra_info": extra_info or info
-    })
+        "extra_info": extra or info,
+    }
+    results.append(data)
+    await ws.send_json(data)
 
+async def send_done(ws):
+    await ws.send_json({"type": "done", "total": 20})
 
-async def send_done(ws: WebSocket):
-    await ws.send_json({
-        "type": "done",
-        "total": 20
-    })
+# ================== AUTH ==================
+@app.post("/login")
+def login(username: str, password: str, db: Session = Depends(get_db)):
+    pwd = hashlib.sha256(password.encode()).hexdigest()
+    user = db.query(User).filter_by(username=username, password_hash=pwd).first()
+    if not user:
+        raise HTTPException(401, "Login xato")
+    return {"user_id": user.id}
 
-# ================== DNS RECORD ==================
-async def _record(ws, domain, record, id, name, ok, fail):
-    try:
-        ans = dns.resolver.resolve(domain, record)
-        await add_test(
-            ws,
-            id,
-            name,
-            True,
-            ok,
-            ", ".join(r.to_text() for r in ans),
-        )
-    except Exception as e:
-        await add_test(ws, id, name, False, fail, str(e))
+# ================== MAIN LOGIC ==================
+async def run_all(ws: WebSocket, domain: str, user_id: int, db: Session):
+    results = []
 
-
-# ================== MAIN TESTS ==================
-async def run_all(ws: WebSocket, domain: str):
-
-    # ---- HTTP / HTTPS ----
-    async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+    async with httpx.AsyncClient(timeout=5) as client:
         try:
             https_res = await client.get(f"https://{domain}")
         except:
@@ -77,142 +112,122 @@ async def run_all(ws: WebSocket, domain: str):
         except:
             http_res = None
 
-    # ---- DNS ----
     try:
-        answers = dns.resolver.resolve(domain, "A")
-        await add_test(
-            ws, 1, "DNS mavjudligi", True,
-            "DNS topildi",
-            ", ".join(r.to_text() for r in answers)
-        )
+        dns.resolver.resolve(domain, "A")
+        await add_test(ws, results, 1, "DNS mavjudligi", True, "DNS topildi")
     except Exception as e:
-        await add_test(ws, 1, "DNS mavjudligi", False, "DNS topilmadi", str(e))
+        await add_test(ws, results, 1, "DNS mavjudligi", False, "DNS topilmadi", str(e))
 
-    await _record(ws, domain, "A", 2, "A record", "IPv4 mavjud", "IPv4 yo‘q")
-    await _record(ws, domain, "AAAA", 3, "AAAA record", "IPv6 mavjud", "IPv6 yo‘q")
-    await _record(ws, domain, "MX", 4, "MX record", "Email server mavjud", "MX yo‘q")
-    await _record(ws, domain, "NS", 5, "NS record", "NS mavjud", "NS yo‘q")
+    async def record(code, rec, name):
+        try:
+            ans = dns.resolver.resolve(domain, rec)
+            await add_test(ws, results, code, name, True, "Mavjud", ", ".join(r.to_text() for r in ans))
+        except:
+            await add_test(ws, results, code, name, False, "Yo‘q")
 
-    # ---- HTTPS ----
+    await record(2, "A", "A record")
+    await record(3, "AAAA", "AAAA record")
+    await record(4, "MX", "MX record")
+    await record(5, "NS", "NS record")
+
     if https_res:
-        await add_test(
-            ws, 6, "HTTPS ishlashi", True,
-            "HTTPS ishlaydi",
-            f"Status: {https_res.status_code}"
-        )
+        await add_test(ws, results, 6, "HTTPS", True, "HTTPS ishlaydi")
     else:
-        await add_test(ws, 6, "HTTPS ishlashi", False, "HTTPS ochilmadi")
+        await add_test(ws, results, 6, "HTTPS", False, "HTTPS yo‘q")
 
-    # ---- HTTP → HTTPS ----
     if http_res:
-        await add_test(
-            ws, 7, "HTTP → HTTPS redirect",
-            http_res.status_code in (301, 302),
-            "Redirect tekshirildi",
-            f"Status: {http_res.status_code}"
-        )
+        await add_test(ws, results, 7, "HTTP → HTTPS", http_res.status_code in (301, 302), "Redirect")
     else:
-        await add_test(ws, 7, "HTTP → HTTPS redirect", False, "HTTP ochilmadi")
+        await add_test(ws, results, 7, "HTTP → HTTPS", False, "HTTP yo‘q")
 
-    # ---- SSL / TLS (FAҚAT HTTPS ASOSIDA) ----
     if https_res:
-        await add_test(ws, 8, "SSL sertifikat", True, "SSL mavjud")
-        await add_test(ws, 9, "SSL muddati", True, "Sertifikat mavjud")
-        await add_test(ws, 10, "TLS qo‘llab-quvvatlanadi", True, "TLS mavjud")
-    else:
-        await add_test(ws, 8, "SSL sertifikat", False, "SSL yo‘q")
-        await add_test(ws, 9, "SSL muddati", False, "SSL yo‘q")
-        await add_test(ws, 10, "TLS qo‘llab-quvvatlanadi", False, "TLS yo‘q")
+        for i, h in enumerate([
+            "Strict-Transport-Security",
+            "Content-Security-Policy",
+            "X-Frame-Options",
+            "X-Content-Type-Options",
+            "Referrer-Policy"
+        ], start=11):
+            await add_test(ws, results, i, h, h in https_res.headers, https_res.headers.get(h, "Yo‘q"))
 
-    # ---- SECURITY HEADERS ----
-    headers = https_res.headers if https_res else {}
-
-    security_headers = [
-        (11, "HSTS", "Strict-Transport-Security"),
-        (12, "CSP", "Content-Security-Policy"),
-        (13, "X-Frame-Options", "X-Frame-Options"),
-        (14, "X-Content-Type-Options", "X-Content-Type-Options"),
-        (15, "Referrer-Policy", "Referrer-Policy"),
-    ]
-
-    for id, name, h in security_headers:
-        await add_test(
-            ws,
-            id,
-            name,
-            h in headers,
-            f"{h} tekshirildi",
-            headers.get(h, "Yo‘q"),
-        )
-
-    # ---- WHOIS ----
     try:
         w = await asyncio.to_thread(whois.whois, domain)
-        await add_test(ws, 16, "Whois mavjud", True, "Whois mavjud")
-
         created = w.creation_date
         if isinstance(created, list):
             created = created[0]
+        await add_test(ws, results, 16, "Whois", True, f"Yaratilgan: {created}")
+        await add_test(ws, results, 17, "Domain yoshi", created.year < datetime.now().year, "Tekshirildi")
+    except:
+        await add_test(ws, results, 16, "Whois", False, "Yo‘q")
+        await add_test(ws, results, 17, "Domain yoshi", False, "Aniqlanmadi")
 
-        await add_test(
-            ws,
-            17,
-            "Domain yoshi",
-            created.year < datetime.now().year,
-            f"Yaratilgan sana: {created}",
-        )
-    except Exception as e:
-        await add_test(ws, 16, "Whois mavjud", False, "Whois yo‘q", str(e))
-        await add_test(ws, 17, "Domain yoshi", False, "Aniqlanmadi")
-
-    # ---- SPEED ----
     if https_res:
         speed = https_res.elapsed.total_seconds()
-        await add_test(ws, 18, "Server tezligi", speed < 2, f"{speed:.2f}s")
-    else:
-        await add_test(ws, 18, "Server tezligi", False, "O‘lchab bo‘lmadi")
+        await add_test(ws, results, 18, "Tezlik", speed < 2, f"{speed:.2f}s")
 
-    # ---- IP ----
     try:
         ip = socket.gethostbyname(domain)
-        await add_test(ws, 19, "IP address", True, "IP topildi", ip)
-    except Exception as e:
-        await add_test(ws, 19, "IP address", False, "IP topilmadi", str(e))
+        await add_test(ws, results, 19, "IP", True, ip)
+    except:
+        await add_test(ws, results, 19, "IP", False, "Yo‘q")
 
-    # ---- DNSSEC ----
     try:
         dns.resolver.resolve(domain, "DNSKEY")
-        await add_test(ws, 20, "DNSSEC", True, "DNSSEC mavjud")
+        await add_test(ws, results, 20, "DNSSEC", True, "Mavjud")
     except:
-        await add_test(ws, 20, "DNSSEC", False, "DNSSEC yo‘q")
+        await add_test(ws, results, 20, "DNSSEC", False, "Yo‘q")
 
-    # ---- DONE ----
     await send_done(ws)
+
+    passed = len([r for r in results if r["passed"]])
+    percent = int((passed / 20) * 100)
+
+    check = DomainCheck(user_id=user_id, domain=domain, percent=percent)
+    db.add(check)
+    db.commit()
+    db.refresh(check)
+
+    for r in results:
+        db.add(DomainCheckResult(
+            check_id=check.id,
+            test_code=r["id"],
+            test_name=r["name"],
+            passed=r["passed"],
+            info=r["info"],
+            extra_info=r["extra_info"]
+        ))
+    db.commit()
+
+# ================== HISTORY API ==================
+@app.get("/history/{user_id}")
+def history(user_id: int, db: Session = Depends(get_db)):
+    return db.query(DomainCheck).filter_by(user_id=user_id).order_by(DomainCheck.created_at.desc()).all()
+
+@app.get("/history/view/{check_id}")
+def view(check_id: int, db: Session = Depends(get_db)):
+    return db.query(DomainCheckResult).filter_by(check_id=check_id).order_by(DomainCheckResult.test_code).all()
+
+@app.delete("/history/{check_id}")
+def delete(check_id: int, db: Session = Depends(get_db)):
+    db.query(DomainCheck).filter_by(id=check_id).delete()
+    db.commit()
+    return {"status": "deleted"}
 
 # ================== WEBSOCKET ==================
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket(ws: WebSocket):
     await ws.accept()
-    print("✅ Client connected")
-
+    db = SessionLocal()
     try:
         while True:
             data = await ws.receive_json()
-            domain = data.get("domain")
-
-            if domain:
-                await run_all(ws, domain)
-
+            await run_all(ws, data["domain"], data["user_id"], db)
     except WebSocketDisconnect:
-        print("🔌 Client disconnected")
-    except Exception as e:
-        print("❌ WS error:", e)
+        pass
+    finally:
+        db.close()
 
 # ================== RUN ==================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
