@@ -1,6 +1,8 @@
 fastapi
-uvicorn[standard]
-httpx
+uvicorn
+sqlalchemy
+aiomysql
+python-dotenv
 dnspython
-requests
+httpx
 python-whois
