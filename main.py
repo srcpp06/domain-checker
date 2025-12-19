@@ -101,13 +101,20 @@ async def send_done(ws):
 
 # ================== AUTH ==================
 @app.post("/login")
-def login(username: str, password: str, db: Session = Depends(get_db)):
-    pwd = hashlib.sha256(password.encode()).hexdigest()
-    user = db.query(User).filter_by(username=username, password_hash=pwd).first()
-    if not user:
-        raise HTTPException(401, "Login xato")
-    return {"user_id": user.id}
+def login(data: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(
+        User.username == data.username,
+        User.password == data.password
+    ).first()
 
+    if not user:
+        raise HTTPException(status_code=401, detail="Login yoki parol xato")
+
+    return {
+        "success": True,
+        "user_id": user.id,
+        "username": user.username
+    }
 # ================== MAIN LOGIC ==================
 async def run_all(ws: WebSocket, domain: str, user_id: int, db: Session):
     results = []
