@@ -5,11 +5,15 @@ import whois
 import asyncio
 import os
 from sqlalchemy import create_engine
-
+import httpx
 import hashlib
 from datetime import datetime
+from pydantic import BaseModel
 
-import httpx
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (
@@ -39,7 +43,7 @@ class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
     username = Column(String(50), unique=True)
-    password_hash = Column(String(255))
+    password = Column(String(255))
 
 
 class DomainCheck(Base):
@@ -102,12 +106,9 @@ async def send_done(ws):
 # ================== AUTH ==================
 @app.post("/login")
 def login(data: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(
-        User.username == data.username,
-        User.password == data.password
-    ).first()
-
-    if not user:
+    user = db.query(User).filter(User.username == data.username).first()
+    
+    if not user or user.password != data.password:
         raise HTTPException(status_code=401, detail="Login yoki parol xato")
 
     return {
