@@ -117,94 +117,151 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
         "username": user.username
     }
 # ================== MAIN LOGIC ==================
+# ... oldingi importlar va modellar o'zgarmaydi ...
+
 async def run_all(ws: WebSocket, domain: str, user_id: int, db: Session):
     results = []
 
-    async with httpx.AsyncClient(timeout=5) as client:
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        https_res = None
+        http_res = None
         try:
-            https_res = await client.get(f"https://{domain}")
-        except:
-            https_res = None
+            https_res = await client.get(f"https://{domain}", headers={"User-Agent": "DomainCheckerBot/1.0"})
+            https_status = https_res.status_code
+        except Exception as e:
+            https_status = None
 
         try:
-            http_res = await client.get(f"http://{domain}")
+            http_res = await client.get(f"http://{domain}", headers={"User-Agent": "DomainCheckerBot/1.0"})
+            http_status = http_res.status_code if http_res else None
         except:
-            http_res = None
+            http_status = None
 
+    # 1. DNS mavjudligi
     try:
         dns.resolver.resolve(domain, "A")
-        await add_test(ws, results, 1, "DNS mavjudligi", True, "DNS topildi")
+        await add_test(ws, results, 1, "DNS mavjudligi", True, "DNS muvaffaqiyatli topildi", "Domen DNS serverlarda mavjud")
     except Exception as e:
-        await add_test(ws, results, 1, "DNS mavjudligi", False, "DNS topilmadi", str(e))
+        await add_test(ws, results, 1, "DNS mavjudligi", False, "DNS topilmadi", f"Xato: {str(e)}")
 
-    async def record(code, rec, name):
+    # 2-5. DNS recordlar
+    async def record(code, rec, name, description):
         try:
             ans = dns.resolver.resolve(domain, rec)
-            await add_test(ws, results, code, name, True, "Mavjud", ", ".join(r.to_text() for r in ans))
+            records = ", ".join(r.to_text() for r in ans)
+            await add_test(ws, results, code, name, True, f"{len(ans)} ta rekord topildi", f"Recordlar: {records}\n{description}")
         except:
-            await add_test(ws, results, code, name, False, "Yo‘q")
+            await add_test(ws, results, code, name, False, "Rekord topilmadi", description)
 
-    await record(2, "A", "A record")
-    await record(3, "AAAA", "AAAA record")
-    await record(4, "MX", "MX record")
-    await record(5, "NS", "NS record")
+    await record(2, "A", "A rekord (IPv4)", "Saytning IPv4 manzili")
+    await record(3, "AAAA", "AAAA rekord (IPv6)", "Saytning IPv6 manzili (kelajak uchun muhim)")
+    await record(4, "MX", "MX rekord (Email)", "Email xizmatlari uchun kerak")
+    await record(5, "NS", "NS rekord (Name Server)", "Domenni boshqaruvchi serverlar")
 
-    if https_res:
-        await add_test(ws, results, 6, "HTTPS", True, "HTTPS ishlaydi")
+    # 6. HTTPS mavjudligi
+    if https_res and https_status == 200:
+        await add_test(ws, results, 6, "HTTPS ishlaydi", True, "Sayt xavfsiz ulanishni qo‘llab-quvvatlaydi", "SSL/TLS sertifikati faol")
     else:
-        await add_test(ws, results, 6, "HTTPS", False, "HTTPS yo‘q")
+        await add_test(ws, results, 6, "HTTPS ishlaydi", False, "HTTPS ishlamaydi", "Sayt faqat HTTP orqali ishlaydi — xavfsiz emas")
 
+    # 7. HTTP → HTTPS redirect
+    redirect_good = False
     if http_res:
-        await add_test(ws, results, 7, "HTTP → HTTPS", http_res.status_code in (301, 302), "Redirect")
-    else:
-        await add_test(ws, results, 7, "HTTP → HTTPS", False, "HTTP yo‘q")
+        if http_res.status_code in (301, 302, 303, 307, 308) and http_res.headers.get("Location", "").startswith("https://"):
+            redirect_good = True
+    await add_test(ws, results, 7, "HTTP → HTTPS yo‘naltirish", redirect_good, 
+                   "Foydalanuvchilar avtomatik HTTPS ga o‘tadi" if redirect_good else "Yo‘naltirish yo‘q yoki noto‘g‘ri",
+                   "Hackerlik hujumlaridan himoya qiladi")
+
+    # 8-12. Xavfsizlik headerlari
+    headers = {
+        8: ("Strict-Transport-Security", "HSTS", "Brauzerni faqat HTTPS bilan ishlashga majbur qiladi"),
+        9: ("Content-Security-Policy", "CSP", "XSS va boshqa inyeksiya hujumlaridan himoya"),
+        10: ("X-Frame-Options", "Clickjacking himoyasi", "Sayt iframe ichida ochilishini oldini oladi"),
+        11: ("X-Content-Type-Options", "MIME sniffing himoyasi", "Fayl turini noto‘g‘ri taxmin qilishni oldini oladi"),
+        12: ("Referrer-Policy", "Referrer ma'lumoti", "Foydalanuvchi maxfiyligini himoya qiladi")
+    }
 
     if https_res:
-        for i, h in enumerate([
-            "Strict-Transport-Security",
-            "Content-Security-Policy",
-            "X-Frame-Options",
-            "X-Content-Type-Options",
-            "Referrer-Policy"
-        ], start=8):  # <--- BU YERDA O'ZGARTIRDIM: start=8 (8-12 headers)
-            await add_test(ws, results, i, h, h in https_res.headers, https_res.headers.get(h, "Yo‘q"))
+        for code, (header, short, desc) in headers.items():
+            value = https_res.headers.get(header)
+            passed = value is not None
+            await add_test(ws, results, code, short, passed, value or "Yo‘q", desc)
+    else:
+        for code, (_, short, desc) in headers.items():
+            await add_test(ws, results, code, short, False, "HTTPS yo‘q", desc)
 
+    # 13-14. Whois va yoshi
     try:
         w = await asyncio.to_thread(whois.whois, domain)
         created = w.creation_date
         if isinstance(created, list):
             created = created[0]
-        await add_test(ws, results, 13, "Whois", True, f"Yaratilgan: {created}")  # <--- Id'lar o'zgardi
-        await add_test(ws, results, 14, "Domain yoshi", created.year < datetime.now().year, "Tekshirildi")
+        if created:
+            age = datetime.now().year - created.year
+            await add_test(ws, results, 13, "Domen ro‘yxatga olingan", True, f"{created.date()}", f"Registrar: {w.registrar or 'Nomaʼlum'}")
+            await add_test(ws, results, 14, "Domen yoshi", age >= 1, f"{age} yil", "Eski domenlar ko‘proq ishonchli hisoblanadi")
+        else:
+            raise Exception("Ma'lumot topilmadi")
     except:
-        await add_test(ws, results, 13, "Whois", False, "Yo‘q")
-        await add_test(ws, results, 14, "Domain yoshi", False, "Aniqlanmadi")
+        await add_test(ws, results, 13, "Domen ro‘yxatga olingan", False, "Ma'lumot topilmadi", "Whois server javob bermadi")
+        await add_test(ws, results, 14, "Domen yoshi", False, "Aniqlanmadi", "Yoshni hisoblash imkonsiz")
 
+    # 15. Sayt tezligi
     if https_res:
         speed = https_res.elapsed.total_seconds()
-        await add_test(ws, results, 15, "Tezlik", speed < 2, f"{speed:.2f}s")
+        passed = speed < 2
+        await add_test(ws, results, 15, "Sahifa yuklanish tezligi", passed, f"{speed:.2f} sekund", "Google reytingiga taʼsir qiladi (<2s ideal)")
+    else:
+        await add_test(ws, results, 15, "Sahifa yuklanish tezligi", False, "HTTPS yo‘q", "Tezlikni o‘lchash imkonsiz")
 
+    # 16. IP manzil
     try:
         ip = socket.gethostbyname(domain)
-        await add_test(ws, results, 16, "IP", True, ip)
+        await add_test(ws, results, 16, "IP manzil", True, ip, "Domen IP ga muvaffaqiyatli bog‘langan")
     except:
-        await add_test(ws, results, 16, "IP", False, "Yo‘q")
+        await add_test(ws, results, 16, "IP manzil", False, "Topilmadi", "DNS yoki tarmoq muammosi bo‘lishi mumkin")
 
+    # 17. DNSSEC
     try:
         dns.resolver.resolve(domain, "DNSKEY")
-        await add_test(ws, results, 17, "DNSSEC", True, "Mavjud")
+        await add_test(ws, results, 17, "DNSSEC himoyasi", True, "Faol", "DNS soxtalashtirishdan himoya qiladi")
     except:
-        await add_test(ws, results, 17, "DNSSEC", False, "Yo‘q")
+        await add_test(ws, results, 17, "DNSSEC himoyasi", False, "Yo‘q", "Hujumlarga ochiqroq")
 
-    # Qo'shimcha 18-20 testlar (agar kerak bo'lsa qo'sh, hozircha placeholder, lekin soni 20 bo'lishi uchun)
-    await add_test(ws, results, 18, "Qo'shimcha test 1", True, "Placeholder")
-    await add_test(ws, results, 19, "Qo'shimcha test 2", False, "Placeholder")
-    await add_test(ws, results, 20, "Qo'shimcha test 3", True, "Placeholder")
+    # 18. TXT rekord (SPF/DMARC)
+    try:
+        ans = dns.resolver.resolve(domain, "TXT")
+        txt_records = [r.to_text().strip('"') for r in ans]
+        has_spf = any("v=spf1" in t for t in txt_records)
+        has_dmarc = any(t.startswith("v=DMARC1") for t in txt_records)
+        passed = has_spf or has_dmarc
+        info = []
+        if has_spf: info.append("SPF mavjud")
+        if has_dmarc: info.append("DMARC mavjud")
+        await add_test(ws, results, 18, "Email autentifikatsiyasi (SPF/DMARC)", passed, ", ".join(info) or "Yo‘q", "Email soxtalashtirishdan himoya qiladi")
+    except:
+        await add_test(ws, results, 18, "Email autentifikatsiyasi (SPF/DMARC)", False, "TXT rekord yo‘q", "Spam va phishing xavfi yuqori")
+
+    # 19. CAA rekord (SSL sertifikat nazorati)
+    try:
+        dns.resolver.resolve(domain, "CAA")
+        await add_test(ws, results, 19, "CAA rekord (Sertifikat nazorati)", True, "Mavjud", "Faqat ruxsat etilgan CA lar sertifikat bera oladi")
+    except:
+        await add_test(ws, results, 19, "CAA rekord (Sertifikat nazorati)", False, "Yo‘q", "Har qanday CA sertifikat bera oladi")
+
+    # 20. Robots.txt mavjudligi
+    try:
+        robots_res = await client.get(f"https://{domain}/robots.txt")
+        passed = robots_res.status_code == 200
+        await add_test(ws, results, 20, "robots.txt fayli", passed, "Mavjud" if passed else "Yo‘q", "Qidiruv tizimlari uchun ko‘rsatma beradi")
+    except:
+        await add_test(ws, results, 20, "robots.txt fayli", False, "Yo‘q yoki xato", "Sayt qidiruvda to‘liq indekslanmasligi mumkin")
 
     await send_done(ws)
 
-    passed = len([r for r in results if r["passed"]])
-    percent = int((passed / 20) * 100)
+    passed_count = len([r for r in results if r["passed"]])
+    percent = int((passed_count / 20) * 100)
 
     check = DomainCheck(user_id=user_id, domain=domain, percent=percent)
     db.add(check)
@@ -221,7 +278,6 @@ async def run_all(ws: WebSocket, domain: str, user_id: int, db: Session):
             extra_info=r["extra_info"]
         ))
     db.commit()
-
 # Qolgan qismi o'zgarmaydi (history API, websocket, run)
 # ================== HISTORY API ==================
 @app.get("/history/{user_id}")
