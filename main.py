@@ -25,7 +25,7 @@ DB_PASSWORD = os.environ["DB_PASSWORD"]
 DB_NAME = os.environ["DB_NAME"]
 
 DATABASE_URL = (
-    f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}"
+    f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}"
     f"@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
 
